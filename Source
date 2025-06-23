@@ -1,0 +1,250 @@
+import requests
+import time
+import json
+import os
+import smtplib
+from email.mime.text import MIMEText
+import base64
+
+# --- AYARLAR ---
+TOKEN = ""  # Telegram bot tokenin (buraya kendi tokenini koy)
+MAIL_SENDER = ""  # Gönderen mail adresi (Gmail)
+MAIL_PASSWORD = ""  # Gmail uygulama şifresi
+MAIL_RECEIVER = ""  # Rapor mailinin gideceği adres
+NEWS_API_KEY = ""  # NewsAPI key
+BITLY_TOKEN = None  # Bitly token yoksa None bırakabilirsin
+
+DOSYA_GONDERILEN = "gonderilenler.json"  # Gönderilen haber linkleri dosyası
+DOSYA_KULLANICILAR = "kullanicilar.json"  # Kullanıcı ayarları dosyası
+
+KANAL_ID = -1001234567890  # Telegram kanal ID'si, kendi kanal ID'n ile değiştir
+
+KATEGORI_KEYWORDS = {
+    "genel": "iran OR israil OR ekonomi",
+    "ekonomi": "ekonomi OR finans OR para",
+    "savas": "savaş OR çatışma OR saldırı",
+    "teknoloji": "teknoloji OR bilişim OR yapay zeka",
+}
+
+DESTEKLI_DILLER = ["tr", "en"]
+
+# --- FONKSİYONLAR ---
+
+def load_json(file):
+    if os.path.exists(file):
+        with open(file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_json(file, data):
+    with open(file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def send_error_email(subject, body):
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = MAIL_SENDER
+    msg['To'] = MAIL_RECEIVER
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(MAIL_SENDER, MAIL_PASSWORD)
+            server.sendmail(MAIL_SENDER, MAIL_RECEIVER, msg.as_string())
+        print("📧 Hata maili gönderildi.")
+    except Exception as e:
+        print("❌ Mail gönderme hatası:", e)
+
+def bitly_shorten(long_url):
+    if not BITLY_TOKEN:
+        return long_url
+    headers = {"Authorization": f"Bearer {BITLY_TOKEN}"}
+    json_data = {"long_url": long_url}
+    response = requests.post("https://api-ssl.bitly.com/v4/shorten", headers=headers, json=json_data)
+    if response.status_code == 200:
+        return response.json().get("link", long_url)
+    else:
+        print("❌ Bitly link kısaltma hatası:", response.text)
+        return long_url
+
+def send_message(chat_id, text, reply_markup=None):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    resp = requests.post(url, data=data)
+    if resp.status_code != 200:
+        print("❌ Mesaj gönderme hatası:", resp.text)
+        send_error_email("Telegram Mesaj Gönderme Hatası", resp.text)
+    return resp.status_code == 200
+
+def shorten_text(text, max_len=500):
+    if text and len(text) > max_len:
+        return text[:max_len].rsplit(' ',1)[0] + "..."
+    return text or ""
+
+def fetch_news(query, language='tr', sort="popularity"):
+    url = (
+        "https://newsapi.org/v2/everything?"
+        f"q={query}&"
+        f"language={language}&"
+        f"sortBy={sort}&"
+        f"apiKey={NEWS_API_KEY}"
+    )
+    try:
+        response = requests.get(url)
+        data = response.json()
+        return data.get("articles", [])
+    except Exception as e:
+        send_error_email("NewsAPI Hata", str(e))
+        return []
+
+def get_hashtags(keywords):
+    hashtags = {
+        "iran": "🇮🇷 #İran",
+        "israil": "🇮🇱 #İsrail",
+        "ekonomi": "💰 #Ekonomi",
+        "savaş": "⚔️ #Savaş",
+        "güncel": "📰 #Güncel",
+        "teknoloji": "🤖 #Teknoloji"
+    }
+    tags = [hashtags.get(k.lower(), "") for k in keywords]
+    return " ".join([t for t in tags if t])
+
+def get_updates(offset=None):
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+    if offset:
+        url += f"?offset={offset}"
+    resp = requests.get(url)
+    if resp.status_code == 200:
+        return resp.json().get("result", [])
+    return []
+
+def handle_commands(kullanicilar, last_update_id):
+    updates = get_updates(last_update_id)
+    for update in updates:
+        update_id = update["update_id"]
+        message = update.get("message")
+        if not message:
+            continue
+        chat_id = message["chat"]["id"]
+        user_id = str(message["from"]["id"])
+        text = message.get("text", "").lower()
+
+        if user_id not in kullanicilar:
+            kullanicilar[user_id] = {
+                "chat_id": chat_id,
+                "kategori": "genel",
+                "dil": "tr"
+            }
+
+        if text.startswith("/dil "):
+            secim = text.split("/dil ")[1]
+            if secim in DESTEKLI_DILLER:
+                kullanicilar[user_id]["dil"] = secim
+                # Komut cevabı gönderilmiyor
+            else:
+                pass
+        # Bilinmeyen komutlara yanıt yok
+
+        save_json(DOSYA_KULLANICILAR, kullanicilar)
+        last_update_id = update_id + 1
+    return last_update_id
+
+def send_news(kullanicilar, gonderilenler, mail_raporu):
+    for user_id, info in kullanicilar.items():
+        query = KATEGORI_KEYWORDS.get(info.get("kategori", "genel"), "iran OR israil OR ekonomi")
+        dil = info.get("dil", "tr")
+        haberler = fetch_news(query, language=dil)
+
+        for haber in haberler[:3]:
+            link = haber.get("url")
+            if link in gonderilenler:
+                continue
+
+            baslik = haber.get("title", "")
+            aciklama = shorten_text(haber.get("description", ""))
+            hashtaglar = get_hashtags(query.lower().split(" OR "))
+            link_kisa = bitly_shorten(link)
+
+            mesaj = (
+                f"📰 <b>{baslik}</b>\n\n"
+                f"{aciklama}\n\n"
+                f"🔗 <a href='{link_kisa}'>Habere Git</a>\n\n"
+                f"{hashtaglar}"
+            )
+            reply_markup = {
+                "inline_keyboard": [
+                    [{"text": "Haberi Oku", "url": link_kisa}]
+                ]
+            }
+
+            # Kanala gönderiyoruz
+            success = send_message(KANAL_ID, mesaj, reply_markup=reply_markup)
+
+            if success:
+                gonderilenler.add(link)
+                mail_raporu.append(mesaj)
+                print(f"Haber gönderildi: {baslik}")
+
+def send_daily_mail(mail_raporu):
+    if not mail_raporu:
+        print("📧 Mail raporu boş, gönderilmiyor.")
+        return
+    body = "\n\n".join(mail_raporu)
+    msg = MIMEText(body, "html", "utf-8")
+    msg['Subject'] = "Günlük Haber Raporu"
+    msg['From'] = MAIL_SENDER
+    msg['To'] = MAIL_RECEIVER
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(MAIL_SENDER, MAIL_PASSWORD)
+            server.sendmail(MAIL_SENDER, MAIL_RECEIVER, msg.as_string())
+        print("📧 Günlük haber raporu maili gönderildi.")
+    except Exception as e:
+        print("❌ Günlük mail gönderme hatası:", e)
+
+def show_credit():
+    encoded = b'TWFkZSBieSB0aGVyZW5pem0='  # base64 kodu: "Made by therenizm"
+    text = base64.b64decode(encoded).decode()
+    # RGB pembe renk koduyla yazdırma (terminalde renkli)
+    print(f"\033[38;2;255;0;128m{text}\033[0m")
+
+def main():
+    kullanicilar = load_json(DOSYA_KULLANICILAR)
+    gonderilenler = load_json(DOSYA_GONDERILEN)
+    if isinstance(gonderilenler, dict):
+        gonderilenler = set(gonderilenler.keys())  # Eski tip destek
+    else:
+        gonderilenler = set(gonderilenler)
+    mail_raporu = []
+
+    last_update_id = None
+    son_mail_zamani = 0
+    MAIL_INTERVAL = 60*60*24  # 24 saat
+
+    while True:
+        try:
+            last_update_id = handle_commands(kullanicilar, last_update_id)
+            send_news(kullanicilar, gonderilenler, mail_raporu)
+
+            save_json(DOSYA_GONDERILEN, list(gonderilenler))
+            save_json(DOSYA_KULLANICILAR, kullanicilar)
+
+            if time.time() - son_mail_zamani > MAIL_INTERVAL:
+                send_daily_mail(mail_raporu)
+                mail_raporu.clear()
+                son_mail_zamani = time.time()
+
+            time.sleep(600)  # 10 dakika
+        except Exception as e:
+            print("❌ Hata:", e)
+            send_error_email("Bot Hatası", str(e))
+            time.sleep(60)
+
+if __name__ == "__main__":
+    show_credit()
+    main()
